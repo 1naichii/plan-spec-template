@@ -58,6 +58,21 @@ ROLLING_OUTPUT_LINES=5
 ROLLING_OUTPUT_INTERVAL=10
 ROLLING_RENDERED_LINES=0
 
+# New configuration options
+DRY_RUN=false
+RESUME_MODE=false
+VERBOSE=false
+LOG_RETENTION_DAYS="${RALPH_LOG_RETENTION:-7}"
+PAUSE_BETWEEN_ITERATIONS="${RALPH_PAUSE:-2}"
+
+# Statistics tracking
+STATS_STARTED=0
+STATS_COMPLETED=0
+STATS_FAILED=0
+STATS_START_TIME=""
+declare -a COMPLETED_SPECS=()
+declare -a FAILED_SPECS=()
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -70,6 +85,79 @@ NC='\033[0m'
 
 mkdir -p "$LOG_DIR"
 
+# Cleanup old logs (configurable retention)
+cleanup_old_logs() {
+    if [ "$LOG_RETENTION_DAYS" -gt 0 ]; then
+        find "$LOG_DIR" -name "ralph_*.log" -type f -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    fi
+}
+cleanup_old_logs
+
+# Graceful shutdown handler
+SHUTDOWN_REQUESTED=false
+cleanup_and_exit() {
+    SHUTDOWN_REQUESTED=true
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}       SHUTDOWN REQUESTED - Cleaning up...                    ${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Kill any background processes
+    if [ -n "${WATCH_PID:-}" ]; then
+        kill "$WATCH_PID" 2>/dev/null || true
+        wait "$WATCH_PID" 2>/dev/null || true
+    fi
+    
+    # Revert any IN_PROGRESS spec back to PENDING
+    if [ -n "${CURRENT_SPEC:-}" ] && [ -f "$CURRENT_SPEC" ]; then
+        local current_status=$(grep -E "^## Status:" "$CURRENT_SPEC" 2>/dev/null | head -1 | sed 's/## Status: //' || echo "")
+        if [ "$current_status" = "IN_PROGRESS" ]; then
+            echo -e "${YELLOW}Reverting interrupted spec to PENDING...${NC}"
+            sed -i 's/^## Status: IN_PROGRESS$/## Status: PENDING/' "$CURRENT_SPEC"
+        fi
+    fi
+    
+    show_summary
+    exit 130
+}
+trap cleanup_and_exit SIGINT SIGTERM
+
+# Show session summary
+show_summary() {
+    local end_time=$(date +%s)
+    local duration=0
+    if [ -n "$STATS_START_TIME" ]; then
+        duration=$((end_time - STATS_START_TIME))
+    fi
+    local minutes=$((duration / 60))
+    local seconds=$((duration % 60))
+    
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━ SESSION SUMMARY ━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}Duration:${NC}    ${minutes}m ${seconds}s"
+    echo -e "${BLUE}Iterations:${NC}  $ITERATION"
+    echo -e "${GREEN}Completed:${NC}   $STATS_COMPLETED specs"
+    echo -e "${RED}Failed:${NC}      $STATS_FAILED specs"
+    
+    if [ ${#COMPLETED_SPECS[@]} -gt 0 ]; then
+        echo ""
+        echo -e "${GREEN}Completed specs:${NC}"
+        for spec in "${COMPLETED_SPECS[@]}"; do
+            echo -e "  ${GREEN}✓${NC} $spec"
+        done
+    fi
+    
+    if [ ${#FAILED_SPECS[@]} -gt 0 ]; then
+        echo ""
+        echo -e "${RED}Failed/Incomplete specs:${NC}"
+        for spec in "${FAILED_SPECS[@]}"; do
+            echo -e "  ${RED}✗${NC} $spec"
+        done
+    fi
+    
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
+
 # Check constitution for YOLO setting
 YOLO_ENABLED=true
 if [[ -f "$CONSTITUTION" ]]; then
@@ -77,6 +165,93 @@ if [[ -f "$CONSTITUTION" ]]; then
         YOLO_ENABLED=false
     fi
 fi
+
+# Extract priority from spec (supports ## Priority: field or filename prefixes)
+get_spec_priority() {
+    local spec_file="$1"
+    local priority=""
+    
+    # First check for explicit ## Priority: field
+    priority=$(grep -E "^## Priority:" "$spec_file" 2>/dev/null | head -1 | sed 's/## Priority: //' | tr '[:lower:]' '[:upper:]' || echo "")
+    
+    if [ -n "$priority" ]; then
+        case "$priority" in
+            "CRITICAL"|"P0") echo "0" ;;
+            "HIGH"|"P1") echo "1" ;;
+            "MEDIUM"|"P2") echo "2" ;;
+            "LOW"|"P3") echo "3" ;;
+            *) echo "2" ;;  # Default to MEDIUM
+        esac
+        return
+    fi
+    
+    # Fall back to filename-based priority (lower number = higher priority)
+    local basename=$(basename "$spec_file")
+    if [[ "$basename" =~ ^([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "999"  # No numeric prefix = lowest priority
+    fi
+}
+
+# Find next spec to work on (respects priority and resume mode)
+find_next_spec() {
+    local specs_dir="$1"
+    local prefer_in_progress="${2:-false}"
+    
+    [ -d "$specs_dir" ] || return
+    
+    local best_spec=""
+    local best_priority=9999
+    local best_status=""
+    
+    while IFS= read -r spec; do
+        [ -z "$spec" ] && continue
+        
+        local status=$(grep -E "^## Status:" "$spec" 2>/dev/null | head -1 | sed 's/## Status: //' || echo "")
+        
+        # Skip completed specs
+        [ "$status" = "COMPLETE" ] && continue
+        
+        # In resume mode, prefer IN_PROGRESS first
+        if [ "$prefer_in_progress" = true ] && [ "$status" = "IN_PROGRESS" ]; then
+            echo "$spec"
+            return
+        fi
+        
+        # Only consider PENDING specs (or IN_PROGRESS if not in resume mode)
+        if [ "$status" != "PENDING" ] && [ "$status" != "IN_PROGRESS" ]; then
+            continue
+        fi
+        
+        local priority=$(get_spec_priority "$spec")
+        
+        if [ "$priority" -lt "$best_priority" ]; then
+            best_priority="$priority"
+            best_spec="$spec"
+            best_status="$status"
+        fi
+    done < <(find "$specs_dir" -maxdepth 2 -name "*.md" -type f 2>/dev/null | sort -V)
+    
+    echo "$best_spec"
+}
+
+# Count specs by status
+count_specs_by_status() {
+    local specs_dir="$1"
+    local target_status="$2"
+    local count=0
+    
+    [ -d "$specs_dir" ] || echo "0"
+    
+    while IFS= read -r spec; do
+        [ -z "$spec" ] && continue
+        local status=$(grep -E "^## Status:" "$spec" 2>/dev/null | head -1 | sed 's/## Status: //' || echo "")
+        [ "$status" = "$target_status" ] && count=$((count + 1))
+    done < <(find "$specs_dir" -maxdepth 2 -name "*.md" -type f 2>/dev/null)
+    
+    echo "$count"
+}
 
 show_specs_ui() {
     local specs_dir="$1"
@@ -162,37 +337,49 @@ Usage:
   .ralph/scripts/ralph-loop.sh 20         # Build mode, max 20 iterations
   .ralph/scripts/ralph-loop.sh plan       # Planning mode (optional)
   .ralph/scripts/ralph-loop.sh --env .env.custom  # Load custom env file
-  .ralph/scripts/ralph-loop.sh --phase phase-1  # Filter specs by phase prefix
-  .ralph/scripts/ralph-loop.sh --rlm-context ./rlm/context.txt
+  .ralph/scripts/ralph-loop.sh --phase 1  # Filter specs by phase prefix
+  .ralph/scripts/ralph-loop.sh --resume   # Resume from IN_PROGRESS specs first
+  .ralph/scripts/ralph-loop.sh --dry-run  # Preview without executing
+  .ralph/scripts/ralph-loop.sh --verbose  # More detailed output
   .ralph/scripts/ralph-loop.sh --rlm ./rlm/context.txt
 
 Modes:
   build (default)  Pick spec/task and implement
   plan             Create IMPLEMENTATION_PLAN.md from specs (OPTIONAL)
 
-Environment Options:
+Options:
   --env <file>     Load environment variables from file (default: .env)
   --phase <name>   Filter specs by phase directory (e.g., 1 matches phase-1-*/)
-  RALPH_SPECS_DIR  Env variable for specs directory (default: specs)
+  --resume         Prefer IN_PROGRESS specs (resume interrupted work)
+  --dry-run        Show what would happen without executing Claude
+  --verbose        Show more detailed output during execution
+  -h, --help       Show this help message
+
+Environment Variables:
+  RALPH_SPECS_DIR        Specs directory (default: specs)
+  RALPH_MAX_ITERATIONS   Max iterations (default: 0 = unlimited)
+  RALPH_PLAN_FILE        Plan file name (default: IMPLEMENTATION_PLAN.md)
+  RALPH_LOG_RETENTION    Days to keep logs (default: 7)
+  RALPH_PAUSE            Seconds between iterations (default: 2)
+  CLAUDE_CMD             Claude CLI command (default: claude)
 
 Work Sources (checked in order):
   1. IMPLEMENTATION_PLAN.md - If exists, pick highest priority task
   2. SPECS_DIR - Otherwise, pick highest priority incomplete spec (new format)
 
+Spec Priority (checked in order):
+  1. ## Priority: field in spec (CRITICAL > HIGH > MEDIUM > LOW)
+  2. Numeric filename prefix (001-task.md before 010-task.md)
+
 The plan mode is OPTIONAL. Most projects can work directly from specs.
 
 RLM Mode (optional):
   --rlm-context <file>  Treat a large context file as external environment.
-                        The agent should read slices instead of loading it all.
   --rlm [file]          Shortcut for --rlm-context (defaults to rlm/context.txt)
 
 Phase Filtering (optional):
   --phase <name>        Only process specs in a directory matching phase-<name>-*.
-                        Example: --phase 1 will search for a directory like:
-                          phase-1-foundation/
-                          phase-1-auth/
-                        And process all .md files inside that directory,
-                        regardless of filename (e.g., task-1-1-init.md, auth.md, etc.)
+                        Example: --phase 1 will search for phase-1-foundation/
 
 Key Difference: This version COMMITS changes but does NOT PUSH to remote.
 
@@ -202,13 +389,8 @@ How it works:
   3. Claude implements, tests, and verifies acceptance criteria
   4. Claude outputs <promise>DONE</promise> ONLY if criteria are met
   5. Bash loop checks for the magic phrase
-  6. If found, loop commits changes and continues to next iteration (fresh context)
+  6. If found, loop commits changes and continues to next iteration
   7. If not found, loop retries
-
-RLM workspace (when enabled):
-  - rlm/trace/     Prompt snapshots + outputs per iteration
-  - rlm/index.tsv  Index of all iterations (timestamp, prompt, log, status)
-  - rlm/queries/ and rlm/answers/  For optional recursive sub-queries
 
 EOF
 }
@@ -361,6 +543,18 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
+        --dry-run|--dryrun)
+            DRY_RUN=true
+            shift
+            ;;
+        --resume)
+            RESUME_MODE=true
+            shift
+            ;;
+        --verbose|-v)
+            VERBOSE=true
+            shift
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -454,9 +648,9 @@ else
     PROMPT_FILE="$RALPH_DIR/PROMPT_build.md"
 fi
 
-# Create the build prompt if it doesn't exist
-if [ ! -f "$RALPH_DIR/PROMPT_build.md" ]; then
-    cat > "$RALPH_DIR/PROMPT_build.md" << 'BUILDEOF'
+# Create/regenerate the build prompt with current configuration
+# Always regenerate to ensure SPECS_DIR and other paths are current
+cat > "$RALPH_DIR/PROMPT_build.md" << 'BUILDEOF'
 # Ralph Build Mode - New Spec Template (v4.0 Universal)
 
 Based on Geoffrey Huntley's Ralph Wiggum methodology.
@@ -646,11 +840,9 @@ Check:
 
 **If ANY check fails:** Fix the issue and try again. Do NOT output the magic phrase.
 BUILDEOF
-fi
 
-# Create planning prompt (only used if plan mode is explicitly requested)
-if [ ! -f "$RALPH_DIR/PROMPT_plan.md" ]; then
-    cat > "$RALPH_DIR/PROMPT_plan.md" << PLANEOF
+# Create/regenerate planning prompt with current configuration
+cat > "$RALPH_DIR/PROMPT_plan.md" << PLANEOF
 # Ralph Planning Mode (OPTIONAL)
 
 This mode is OPTIONAL. Most projects work fine directly from specs.
@@ -729,7 +921,6 @@ When the plan is complete and saved:
 
 \`<promise>DONE</promise>\`
 PLANEOF
-fi
 
 # Check prompt file exists
 if [ ! -f "$PROMPT_FILE" ]; then
@@ -750,10 +941,17 @@ CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "main")
 HAS_PLAN=false
 HAS_SPECS=false
 SPEC_COUNT=0
+PENDING_COUNT=0
+IN_PROGRESS_COUNT=0
+COMPLETE_COUNT=0
+
 [ -f "$PLAN_FILE" ] && HAS_PLAN=true
 if [ -d "$SPECS_DIR" ]; then
-    SPEC_COUNT=$(find "$SPECS_DIR" -maxdepth 1 -name "*.md" -type f 2>/dev/null | wc -l)
+    SPEC_COUNT=$(find "$SPECS_DIR" -maxdepth 2 -name "*.md" -type f 2>/dev/null | wc -l)
     [ "$SPEC_COUNT" -gt 0 ] && HAS_SPECS=true
+    PENDING_COUNT=$(count_specs_by_status "$SPECS_DIR" "PENDING")
+    IN_PROGRESS_COUNT=$(count_specs_by_status "$SPECS_DIR" "IN_PROGRESS")
+    COMPLETE_COUNT=$(count_specs_by_status "$SPECS_DIR" "COMPLETE")
 fi
 
 echo ""
@@ -761,17 +959,20 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo -e "${GREEN}         RALPH LOOP (Claude Code) - COMMIT ONLY               ${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "${BLUE}Mode:${NC}     $MODE"
-echo -e "${BLUE}Prompt:${NC}   $PROMPT_FILE"
-echo -e "${BLUE}Branch:${NC}   $CURRENT_BRANCH"
-echo -e "${BLUE}Specs Dir:${NC} $SPECS_DIR"
-[ -n "$PHASE_FILTER" ] && echo -e "${BLUE}Phase:${NC}     $PHASE_FILTER (filtered to directory: $(basename "$SPECS_DIR"))"
-echo -e "${YELLOW}YOLO:${NC}     $([ "$YOLO_ENABLED" = true ] && echo "ENABLED" || echo "DISABLED")"
-echo -e "${YELLOW}Push:${NC}     DISABLED (commit only)"
-[ -n "$RLM_CONTEXT_FILE" ] && echo -e "${BLUE}RLM:${NC}      $RLM_CONTEXT_FILE"
-[ -n "$ENV_FILE" ] && echo -e "${BLUE}Env:${NC}      $ENV_FILE"
-[ -n "$SESSION_LOG" ] && echo -e "${BLUE}Log:${NC}      $SESSION_LOG"
-[ $MAX_ITERATIONS -gt 0 ] && echo -e "${BLUE}Max:${NC}      $MAX_ITERATIONS iterations"
+echo -e "${BLUE}Mode:${NC}       $MODE"
+echo -e "${BLUE}Prompt:${NC}     $PROMPT_FILE"
+echo -e "${BLUE}Branch:${NC}     $CURRENT_BRANCH"
+echo -e "${BLUE}Specs Dir:${NC}  $SPECS_DIR"
+[ -n "$PHASE_FILTER" ] && echo -e "${BLUE}Phase:${NC}      $PHASE_FILTER (filtered to directory: $(basename "$SPECS_DIR"))"
+echo -e "${YELLOW}YOLO:${NC}       $([ "$YOLO_ENABLED" = true ] && echo "ENABLED" || echo "DISABLED")"
+echo -e "${YELLOW}Push:${NC}       DISABLED (commit only)"
+[ "$DRY_RUN" = true ] && echo -e "${PURPLE}Dry Run:${NC}    ENABLED (no Claude execution)"
+[ "$RESUME_MODE" = true ] && echo -e "${BLUE}Resume:${NC}     ENABLED (prefer IN_PROGRESS specs)"
+[ "$VERBOSE" = true ] && echo -e "${BLUE}Verbose:${NC}    ENABLED"
+[ -n "$RLM_CONTEXT_FILE" ] && echo -e "${BLUE}RLM:${NC}        $RLM_CONTEXT_FILE"
+[ -n "$ENV_FILE" ] && echo -e "${BLUE}Env:${NC}        $ENV_FILE"
+[ -n "$SESSION_LOG" ] && echo -e "${BLUE}Log:${NC}        $SESSION_LOG"
+[ $MAX_ITERATIONS -gt 0 ] && echo -e "${BLUE}Max:${NC}        $MAX_ITERATIONS iterations"
 echo ""
 echo -e "${BLUE}Work source:${NC}"
 if [ "$HAS_PLAN" = true ]; then
@@ -781,6 +982,7 @@ else
 fi
 if [ "$HAS_SPECS" = true ]; then
     echo -e "  ${GREEN}[✓]${NC} $SPECS_DIR folder with $SPEC_COUNT specs"
+    echo -e "      ${YELLOW}PENDING:${NC} $PENDING_COUNT  ${BLUE}IN_PROGRESS:${NC} $IN_PROGRESS_COUNT  ${GREEN}COMPLETE:${NC} $COMPLETE_COUNT"
 else
     echo -e "  ${RED}[✗]${NC} $SPECS_DIR folder - no .md files found"
 fi
@@ -796,11 +998,23 @@ echo ""
 echo -e "${YELLOW}Press Ctrl+C to stop the loop${NC}"
 echo ""
 
+# Check if all specs are already complete
+if [ "$PENDING_COUNT" -eq 0 ] && [ "$IN_PROGRESS_COUNT" -eq 0 ] && [ "$COMPLETE_COUNT" -gt 0 ]; then
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}       ALL SPECS COMPLETE! Nothing to do.                     ${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    exit 0
+fi
+
 ITERATION=0
 CONSECUTIVE_FAILURES=0
 MAX_CONSECUTIVE_FAILURES=3
+STATS_START_TIME=$(date +%s)
 
 while true; do
+    # Check for shutdown request
+    [ "$SHUTDOWN_REQUESTED" = true ] && break
+    
     # Check max iterations
     if [ $MAX_ITERATIONS -gt 0 ] && [ $ITERATION -ge $MAX_ITERATIONS ]; then
         echo -e "${GREEN}Reached max iterations: $MAX_ITERATIONS${NC}"
@@ -809,30 +1023,51 @@ while true; do
 
     ITERATION=$((ITERATION + 1))
     TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    ITER_START_TIME=$(date +%s)
 
     echo ""
     echo -e "${PURPLE}════════════════════ LOOP $ITERATION ════════════════════${NC}"
     echo -e "${BLUE}[$TIMESTAMP]${NC} Starting iteration $ITERATION"
     echo ""
 
-    # Find and update highest priority PENDING spec to IN_PROGRESS
-    CURRENT_SPEC=""
-    if [ -d "$SPECS_DIR" ]; then
-        while IFS= read -r spec; do
-            status=$(grep -E "^## Status:" "$spec" 2>/dev/null | head -1 | sed 's/## Status: //' || echo "")
-            if [ "$status" = "PENDING" ]; then
-                CURRENT_SPEC="$spec"
-                break
-            fi
-        done < <(find "$SPECS_DIR" -maxdepth 2 -name "*.md" -type f 2>/dev/null | sort)
+    # Find next spec using priority-based selection
+    CURRENT_SPEC=$(find_next_spec "$SPECS_DIR" "$RESUME_MODE")
+    
+    # Check if no work remaining
+    if [ -z "$CURRENT_SPEC" ] && [ -d "$SPECS_DIR" ]; then
+        echo -e "${GREEN}✓ No pending or in-progress specs found.${NC}"
+        echo -e "${GREEN}  All work complete!${NC}"
+        break
     fi
 
     if [ -n "$CURRENT_SPEC" ]; then
         SPEC_NAME=$(basename "$CURRENT_SPEC")
-        echo -e "${YELLOW}Updating status: ${SPEC_NAME} PENDING → IN_PROGRESS${NC}"
-        sed -i 's/^## Status: PENDING$/## Status: IN_PROGRESS/' "$CURRENT_SPEC"
-        echo -e "${GREEN}✓ Status updated${NC}"
+        SPEC_PRIORITY=$(get_spec_priority "$CURRENT_SPEC")
+        current_status=$(grep -E "^## Status:" "$CURRENT_SPEC" 2>/dev/null | head -1 | sed 's/## Status: //' || echo "PENDING")
+        
+        echo -e "${CYAN}Selected spec:${NC} $SPEC_NAME"
+        echo -e "${CYAN}Priority:${NC}      $SPEC_PRIORITY"
+        [ "$VERBOSE" = true ] && echo -e "${CYAN}Full path:${NC}     $CURRENT_SPEC"
+        
+        if [ "$current_status" = "PENDING" ]; then
+            echo -e "${YELLOW}Updating status: ${SPEC_NAME} PENDING → IN_PROGRESS${NC}"
+            if [ "$DRY_RUN" = false ]; then
+                sed -i 's/^## Status: PENDING$/## Status: IN_PROGRESS/' "$CURRENT_SPEC"
+            fi
+            echo -e "${GREEN}✓ Status updated${NC}"
+        else
+            echo -e "${BLUE}Resuming: ${SPEC_NAME} (already IN_PROGRESS)${NC}"
+        fi
         echo ""
+        STATS_STARTED=$((STATS_STARTED + 1))
+    fi
+
+    # Dry run mode - just show what would happen
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${PURPLE}[DRY RUN] Would execute Claude with prompt: $PROMPT_FILE${NC}"
+        echo -e "${PURPLE}[DRY RUN] Working on spec: ${CURRENT_SPEC:-none}${NC}"
+        sleep 1
+        continue
     fi
 
     # Log file for this iteration
@@ -860,7 +1095,11 @@ while true; do
             wait "$WATCH_PID" 2>/dev/null || true
         fi
         echo ""
-        echo -e "${GREEN}✓ Claude execution completed${NC}"
+        
+        # Calculate iteration duration
+        ITER_END_TIME=$(date +%s)
+        ITER_DURATION=$((ITER_END_TIME - ITER_START_TIME))
+        echo -e "${GREEN}✓ Claude execution completed (${ITER_DURATION}s)${NC}"
         
         # Check if DONE promise was output (accept both DONE and ALL_DONE variants)
         if echo "$CLAUDE_OUTPUT" | grep -qE "<promise>(ALL_)?DONE</promise>"; then
@@ -869,6 +1108,8 @@ while true; do
             echo -e "${GREEN}✓ Task completed and committed!${NC}"
             CONSECUTIVE_FAILURES=0
             RLM_STATUS="done"
+            STATS_COMPLETED=$((STATS_COMPLETED + 1))
+            [ -n "$CURRENT_SPEC" ] && COMPLETED_SPECS+=("$(basename "$CURRENT_SPEC")")
             
             # For planning mode, stop after one successful plan
             if [ "$MODE" = "plan" ]; then
@@ -894,6 +1135,8 @@ while true; do
 
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
             RLM_STATUS="incomplete"
+            STATS_FAILED=$((STATS_FAILED + 1))
+            [ -n "$CURRENT_SPEC" ] && FAILED_SPECS+=("$(basename "$CURRENT_SPEC")")
             print_latest_output "$LOG_FILE" "Claude"
 
             if [ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]; then
@@ -925,6 +1168,8 @@ while true; do
 
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         RLM_STATUS="error"
+        STATS_FAILED=$((STATS_FAILED + 1))
+        [ -n "$CURRENT_SPEC" ] && FAILED_SPECS+=("$(basename "$CURRENT_SPEC")")
         print_latest_output "$LOG_FILE" "Claude"
     fi
 
@@ -938,9 +1183,11 @@ while true; do
 
     # Brief pause between iterations
     echo ""
-    echo -e "${BLUE}Waiting 2s before next iteration...${NC}"
-    sleep 2
+    echo -e "${BLUE}Waiting ${PAUSE_BETWEEN_ITERATIONS}s before next iteration...${NC}"
+    sleep "$PAUSE_BETWEEN_ITERATIONS"
 done
+
+show_summary
 
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
