@@ -240,7 +240,7 @@ This spec system works for **any project type**:
 
 ## 📊 Spec Statistics
 
-### Current Specs (MySaham App)
+### Current Specs (xxx)
 
 | Phase | Specs | Status |
 |-------|-------|--------|
@@ -478,7 +478,6 @@ cp specs/SPEC-TEMPLATE.md specs/examples/[domain]/example-name.md
 
 - [SPEC-TEMPLATE.md](./SPEC-TEMPLATE.md) - Universal spec template with examples
 - [HOW-TO-GENERATE-SPECS.md](./HOW-TO-GENERATE-SPECS.md) - Comprehensive creation guide
-- [SPECS-OVERVIEW.md](./SPECS-OVERVIEW.md) - Master tracker of all specs
 - [Ralph Wiggum Spec Guide](https://github.com/your-org/ralph-wiggum) - Iterative development methodology
 
 ## 📞 Support
@@ -511,7 +510,7 @@ cp specs/SPEC-TEMPLATE.md specs/examples/[domain]/example-name.md
 - **v4.0** (2026-01-31) - Universal template for any project type, examples directory
 - **v3.0** (2026-01-28) - Added comprehensive HOW-TO guide
 - **v2.0** (2026-01-27) - Added testing scenarios and success metrics
-- **v1.0** (2026-01-25) - Initial spec system for MySaham App
+- **v1.0** (2026-01-25) - Initial spec system for xxx
 
 ---
 

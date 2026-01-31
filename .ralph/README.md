@@ -1,4 +1,4 @@
-# Ralph Loop - MySaham App
+# Ralph Loop - xxx
 
 Autonomous iterative development system based on Geoffrey Huntley's Ralph Wiggum methodology.
 
@@ -339,8 +339,8 @@ You can filter specs by phase to work on a specific set of tasks:
 ## Related Resources
 
 - [Geoffrey Huntley's Ralph Wiggum](https://github.com/ghuntley/how-to-ralph-wiggum)
-- [Spec Template v4.0](../../jump4it/aiepal/.template/specs-template/SPEC-TEMPLATE.md)
-- [Spec README](../../jump4it/aiepal/.template/specs-template/README.md)
+- [Spec Template v4.0](../specs-template/SPEC-TEMPLATE.md)
+- [Spec README](../specs-template/README.md)
 
 ---
 

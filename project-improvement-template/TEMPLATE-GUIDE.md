@@ -579,7 +579,7 @@ This template is designed to be iterative:
 ## 📞 Support
 
 For questions or improvements to this template:
-- Review the MySaham App improvement plan for real-world examples
+- Review the xxx improvement plan for real-world examples
 - Consult the REFERENCE-GUIDE.md for implementation patterns
 - Adapt templates to match your specific project needs
 - Customize examples to match your domain/tech stack
