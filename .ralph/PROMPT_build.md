@@ -14,7 +14,7 @@ Read `.specify/memory/constitution.md` to understand project principles and cons
 
 Search for incomplete work from these sources (in order):
 
-1. **specs/phase-1-foundation folder** — Look for `.md` files with `## Status: PENDING` or `## Status: IN_PROGRESS`
+1. **.spec/phase-2-data-layer folder** — Look for `.md` files with `## Status: PENDING` or `## Status: IN_PROGRESS`
 2. **IMPLEMENTATION_PLAN.md** — If exists, find unchecked `- [ ]` tasks
 3. **GitHub Issues** — Check for open issues (if this is a GitHub repo)
 4. **Any task tracker** — Jira, Linear, etc. if configured
@@ -42,7 +42,7 @@ Before implementing, search the codebase to verify it's not already done.
 
 **If ALL specs appear complete**, don't just exit — do a quality check:
 
-1. **Randomly pick** one completed spec from `specs/phase-1-foundation`
+1. **Randomly pick** one completed spec from `.spec/phase-2-data-layer`
 2. **Strictly re-verify** ALL its acceptance criteria:
    - Run the actual tests mentioned in the spec
    - Manually verify each criterion is truly met
@@ -59,15 +59,15 @@ This ensures the codebase stays healthy even when "nothing to do."
 
 **IMPORTANT PHASE FILTER IS ACTIVE:** You are working in a specific phase directory.
 
-Phase directory: `specs/phase-1-foundation`
+Phase directory: `.spec/phase-2-data-layer`
 
 **Rules:**
-- Only process specs located in: `specs/phase-1-foundation/`
+- Only process specs located in: `.spec/phase-2-data-layer/`
 - All `.md` files in this directory are part of this phase (regardless of filename)
 - Specs outside this directory should be ignored
 - If no specs found in this directory, output `<promise>DONE</promise>` to confirm phase is complete
 
-**In Phase 1b (re-verification):** Only randomly pick from specs in `specs/phase-1-foundation/`
+**In Phase 1b (re-verification):** Only randomly pick from specs in `.spec/phase-2-data-layer/`
 
 ---
 

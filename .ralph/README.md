@@ -38,6 +38,9 @@ https://github.com/ghuntley/how-to-ralph-wiggum
 ./ralph.sh 20           # Max 20 iterations
 ./ralph.sh plan         # Create implementation plan (optional)
 ./ralph.sh --env .env.custom  # Load custom .env file
+./ralph.sh --resume     # Resume from IN_PROGRESS specs first
+./ralph.sh --dry-run    # Preview without executing
+./ralph.sh --verbose    # More detailed output
 ```
 
 ### Check Spec Status
@@ -45,6 +48,13 @@ https://github.com/ghuntley/how-to-ralph-wiggum
 ```bash
 ./ralph.sh status       # Show pending/in-progress/complete specs
 ```
+
+### YOLO Mode
+
+The script checks `.specify/memory/constitution.md` for YOLO mode configuration:
+- **Enabled by default**: Uses `--dangerously-skip-permissions` flag with Claude CLI
+- **Disabled**: If constitution contains "YOLO Mode.*DISABLED"
+- Can be overridden by setting `YOLO_ENABLED` environment variable
 
 ### Direct Script Access
 
@@ -68,6 +78,8 @@ export RALPH_SPECS_DIR=my-specs
 ## How It Works
 
 1. **Discover**: Find highest priority incomplete spec in `specs/` folder
+   - Priority order: CRITICAL > HIGH > MEDIUM > LOW (from `## Priority:` field)
+   - Falls back to numeric filename prefixes (001-task.md before 010-task.md)
 2. **Implement**: Work on the spec until all acceptance criteria are met
 3. **Verify**: Run tests and validate against spec
 4. **Commit**: Mark spec as complete and commit changes
@@ -117,11 +129,11 @@ Uses the v4.0 Universal spec template:
 
 ## Completion Signal
 
-The loop looks for `<promise>DONE</promise>` to confirm a spec is complete:
+The loop looks for `<promise>DONE</promise>` or `<promise>ALL_DONE</promise>` to confirm a spec is complete:
 - All acceptance criteria marked `[x]`
 - Status changed to `COMPLETE`
 - Changes committed to git
-- `<promise>DONE</promise>` output at end
+- `<promise>DONE</promise>` or `<promise>ALL_DONE</promise>` output at end
 
 ## Important Notes
 
@@ -129,13 +141,20 @@ The loop looks for `<promise>DONE</promise>` to confirm a spec is complete:
 - **Fresh Context**: Each iteration starts with a fresh Claude context window
 - **Quality Check**: If all specs are complete, the loop re-verifies random specs
 - **Consecutive Failures**: Warns after 3 consecutive incomplete iterations
+- **Graceful Shutdown**: Use Ctrl+C to stop - it will revert IN_PROGRESS specs and show summary
+- **Dry Run**: Use `--dry-run` to preview what will happen without executing
+- **Resume Mode**: Use `--resume` to continue from interrupted IN_PROGRESS specs
 
 ## Work Sources (Priority Order)
 
-1. `IMPLEMENTATION_PLAN.md` (if exists) - Pick highest priority task
-2. `specs/` folder - Pick highest priority incomplete spec
-3. GitHub Issues - Open issues (if repo)
-4. Other task trackers - Jira, Linear, etc.
+The loop checks these sources in order:
+
+1. **IMPLEMENTATION_PLAN.md** (if exists) - Pick highest priority unchecked task
+2. **specs/ folder** - Pick highest priority incomplete spec
+   - Uses `## Priority:` field (CRITICAL > HIGH > MEDIUM > LOW)
+   - Falls back to numeric filename prefixes
+3. **GitHub Issues** - Open issues (if this is a GitHub repo)
+4. **Other task trackers** - Jira, Linear, etc. (if configured)
 
 ## RLM Mode (Optional)
 
@@ -147,6 +166,21 @@ For large context files, use RLM mode:
 ```
 
 This treats large context as external environment and uses recursive queries.
+
+**RLM Workspace:**
+- `rlm/trace/` - Prompt/output snapshots for each iteration
+- `rlm/queries/` - Recursive sub-queries
+- `rlm/answers/` - Sub-query results
+- `rlm/index.tsv` - Iteration index with timestamps
+
+The script creates an index file tracking:
+- Timestamp
+- Mode (build/plan)
+- Iteration number
+- Prompt snapshot path
+- Log file path
+- Output snapshot path
+- Status (done/incomplete/error)
 
 ## Logs
 
@@ -199,6 +233,12 @@ RALPH_SPECS_DIR=specs
 
 # RLM (Recursive Language Model) context file for large contexts
 # RALPH_RLM_CONTEXT=rlm/context.txt
+
+# Log retention in days (default: 7)
+# RALPH_LOG_RETENTION=7
+
+# Pause between iterations in seconds (default: 2)
+# RALPH_PAUSE=2
 ```
 
 ### Loading Environment Variables
@@ -221,6 +261,45 @@ This is useful for:
 - Configuring API keys for AI services
 - Setting max iterations for CI/CD
 - Other project-specific environment variables
+
+### Command-Line Options
+
+```bash
+--resume         Prefer IN_PROGRESS specs (resume interrupted work)
+--dry-run        Show what would happen without executing Claude
+--verbose        Show more detailed output during execution
+-h, --help       Show help message
+```
+
+### Statistics & Session Summary
+
+The loop tracks statistics throughout the session:
+
+- **Started**: Number of specs picked up for work
+- **Completed**: Number of specs successfully completed
+- **Failed**: Number of specs that failed or were incomplete
+
+At the end of each session (or on Ctrl+C), a summary is displayed showing:
+- Total session duration
+- Number of iterations completed
+- Complete list of completed specs
+- List of failed/incomplete specs (for review)
+
+### Graceful Shutdown
+
+Press `Ctrl+C` at any time to gracefully shutdown the loop:
+
+- Stops the current iteration
+- Reverts any IN_PROGRESS spec back to PENDING
+- Displays session summary with statistics
+- All completed work remains committed
+
+### Log Retention
+
+Old logs are automatically cleaned up based on `RALPH_LOG_RETENTION` setting:
+- Default: 7 days
+- Set to 0 to keep logs indefinitely
+- Logs older than the retention period are deleted on startup
 
 ### Phase Filtering
 
@@ -265,5 +344,5 @@ You can filter specs by phase to work on a specific set of tasks:
 
 ---
 
-**Version**: 2.0 (Commit-Only + v4.0 Spec Support)
+**Version**: 2.1 (Commit-Only + v4.0 Spec Support + Enhanced Features)
 **Last Updated**: 2026-01-31

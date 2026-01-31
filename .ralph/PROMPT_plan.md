@@ -10,7 +10,7 @@ Only use this when you want a detailed breakdown of specs into smaller tasks.
 
 0a. Read `.specify/memory/constitution.md` for project principles.
 
-0b. Study `specs/phase-1-foundation` to learn all feature specifications (new v4.0 format).
+0b. Study `.spec/phase-2-data-layer` to learn all feature specifications (new v4.0 format).
 
 ## Phase 2: Create Plan
 
